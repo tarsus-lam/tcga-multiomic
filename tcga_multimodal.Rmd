@@ -1,0 +1,262 @@
+---
+title: "tcga_multiomic"
+author: "Tarsus Lam"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Download multiomic TCGA data
+
+```{r download_tcga}
+library(curatedTCGAData)
+
+cohort <- "BRCA"    # Set the TCGA cohort of interest
+data_types <- c("RNASeq2GeneNorm", "Mutation", "Methylation_methyl450")    # Specify data types to retrieve
+
+# Retrieve TCGA data
+readData <- curatedTCGAData(cohort, data_types, version = '2.0.1', dry.run = FALSE)
+readData
+
+# Retrieve and examine sample mapping
+sample_mapping <- sampleMap(readData)
+sample_mapping
+
+# Count the number of datasets per sample/patient
+dataset_counts <- table(table(sample_mapping$primary))
+dataset_counts
+
+# Examine clinical data
+clinical_data <- colData(readData)
+head(colnames(clinical_data), 10)
+
+# Analyze pathology_T_stage and create t_stage factor
+pathology_t_stage_table <- table(clinical_data$pathology_T_stage)
+print(pathology_t_stage_table)
+
+clinical_data$t_stage <- factor(substr(clinical_data$pathology_T_stage, 1, 2))
+
+# Analyze t_stage after removing suffix
+t_stage_table <- table(clinical_data$t_stage)
+t_stage_table
+
+# Analyze vital_status table
+vital_status_table <- table(clinical_data$vital_status)
+vital_status_table
+
+# Observe the relationship between t_stage and vital_status
+t_stage_vs_vital_status_table <- table(clinical_data$t_stage, clinical_data$vital_status)
+t_stage_vs_vital_status_table
+```
+
+## Process mutation data
+
+```{r process_mutation}
+# Access mutation data
+mutation_data <- readData[[1]]
+mutation_data
+
+# Retrieve sample IDs from mutation data
+mutation_sample_ids <- colnames(mutation_data)
+head(mutation_sample_ids)
+
+# Display sample IDs from clinical data
+head(rownames(clinical_data))
+
+# Truncate to first 12 characters to match clinical sample IDs
+mutation_sample_ids <- substr(mutation_sample_ids, 1, 12)
+
+# Check if mutation sample IDs match clinical data
+sample_id_match <- all(mutation_sample_ids %in% rownames(clinical_data))
+sample_id_match
+
+# Display a subset of the mutation data
+mutation_subset <- assay(mutation_data)[1:4, 1:4]
+mutation_subset
+
+# Count the occurrences of NAs in the mutation data
+na_counts <- table(assay(mutation_data)[1,], useNA = "ifany")
+na_counts    # almost all NAs
+
+# Access mutation assay data per sample instead
+mutation_assay <- mutation_data@assays
+class(mutation_assay)
+length(mutation_assay)
+
+mutation_assay_sample <- mutation_assay[[1]]
+mutation_symbols <- mutation_assay_sample$Hugo_Symbol
+mutation_status <- mutation_assay_sample$Mutation_Status
+mutation_classification <- mutation_assay_sample$Variant_Classification
+
+# Display tables for mutation information
+table(mutation_symbols)
+table(mutation_status)
+table(mutation_classification)
+
+# Create a single dataframe for mutation data
+mut_df = mapply(function(id, a) {
+    d = as.data.frame(mcols(a)[c("Hugo_Symbol", "Variant_Classification")])
+    names(d) = c("symbol", "variant_class")
+    d$patientID = id
+    d
+}, id = mutation_sample_ids, a = mutation_assay, SIMPLIFY = FALSE, USE.NAMES = FALSE)
+mutation_df = do.call(rbind, mut_df)
+head(mutation_df)
+
+# Create a table for mutation symbols and variant classifications
+mutation_table <- table(mutation_df$symbol, mutation_df$variant_class)
+
+# Calculate the total number of specific mutation types
+mutation_types <- c("Missense_Mutation", "Nonsense_Mutation", "Frame_Shift_Del", "Frame_Shift_Ins")
+mutation_totals <- apply(mutation_table[, mutation_types], 1, sum)
+
+# Order mutation symbols by the total number of mutations
+mutation_order <- order(mutation_totals, decreasing = TRUE)
+top_mutations <- mutation_table[mutation_order[1:10], mutation_types]
+top_mutations
+```
+
+## Combine mutation and clinical data
+
+```{r mutation_clinical}
+# Calculate the number of mutations per patient
+nmut <- sapply(split(mutation_df$patientID, mutation_df$patientID), length)
+
+# Display the first few values
+head(nmut)
+
+# Determine overlapping information
+nmut_length <- length(nmut)
+clin_rows <- nrow(clinical_data)
+overlap_check <- all(names(nmut) %in% rownames(clinical_data))
+clin_mut <- clinical_data[names(nmut),]
+
+# Display the results
+nmut_length
+clin_rows
+overlap_check
+
+# Create a boxplot of mutations per tumor stage
+with(clin_mut, boxplot(split(nmut, t_stage), log = "y"))
+
+# Combine patient information and TP53 mutation presence
+tp53_mut_pts <- mutation_df[mutation_df$symbol == "TP53", "patientID"]
+clin_mut$tp53_mut <- clin_mut$patientID %in% tp53_mut_pts
+
+# Create a table to show TP53 mutation presence by tumor stage
+table(clin_mut$tp53_mut, clin_mut$t_stage)    # TP53 most common in t2
+```
+
+# Combine expression and clinical data
+
+```{r expression_clinical}
+library(limma)
+
+# Access RNA-Seq data
+rnaseq <- readData[[2]]
+rnaseq
+assay(rnaseq)[1:3, 1:3]
+
+# Perform log2(x+1) transformation
+assay(rnaseq) <- log2(assay(rnaseq) + 1)
+assay(rnaseq)[1:3, 1:3]
+
+# Shorten column names to match clinical data
+colnames(rnaseq) <- substr(colnames(rnaseq), 1, 12)
+
+# Append clinical data to RNA-Seq data
+colData(rnaseq) <- clinical_data[colnames(rnaseq),]
+
+# Treat 't_stage' as numeric and perform differential expression analysis
+rnaseq$numts <- as.numeric(factor(rnaseq$t_stage))
+mm <- model.matrix(~numts, data=colData(rnaseq))
+f1 <- lmFit(assay(rnaseq), mm)
+ef1 <- eBayes(f1)
+top_genes <- topTable(ef1, n=20)[topTable(ef1, n=20)$adj.P.Val <= 0.05,]
+
+# Display the top differentially expressed genes
+top_genes
+
+# Examples of associated genes
+par(mfrow = c(1, 2))
+boxplot(split(assay(rnaseq)["CD1A", ], rnaseq$t_stage), main = "CD1A")    # Higher expression in lower t_stage
+boxplot(split(assay(rnaseq)["PPFIA3", ], rnaseq$t_stage), main = "PPFIA3")    # Higher expression in higher t_stage
+```
+
+# Combine methylation and expression data
+
+```{r methylation_expression}
+library(curatedTCGAData)
+
+# Access the methylation data
+methyl <- readData[[3]]
+methyl
+assay(methyl)
+
+# Filter for primary tumor tissue samples
+isprimary <- sapply(strsplit(colnames(methyl), split = "-"), '[[', 4) == "01A"
+methyl <- methyl[, isprimary]
+
+# Shorten column names to match clinical data
+colnames(methyl) <- substr(colnames(methyl), 1, 12)
+
+# Append clinical data to methylation data
+colData(methyl) <- clinical_data[colnames(methyl),]
+
+# Check for sufficient samples for analysis
+intersect_samples <- length(intersect(colnames(methyl), colnames(rnaseq)))
+
+# Subset the intersection between Methylation and RNA-Seq samples
+methyl_subset <- methyl[, which(colnames(methyl) %in% colnames(rnaseq))]
+rnaseq_subset <- rnaseq[, which(colnames(rnaseq) %in% colnames(methyl))]
+
+# Replace duplicate columns with row means
+duplicates <- unique(colnames(rnaseq_subset)[duplicated(colnames(rnaseq_subset))])
+mean_vals <- sapply(duplicates, function(col) {
+  rowMeans(assay(rnaseq_subset)[, colnames(rnaseq_subset) == col])
+})
+rnaseq_subset <- rnaseq_subset[, !duplicated(colnames(rnaseq_subset))]
+
+# Check for sample and order consistency
+identical_samples <- identical(row.names(assay(rnaseq_subset)), row.names(mean_vals))
+assay(rnaseq_subset)[, duplicates] <- mean_vals
+identical_order <- identical(colnames(rnaseq_subset), colnames(methyl_subset))
+
+# Extract methylation genes
+methyl_genes <- rowData(methyl_subset)$Gene_Symbol
+methyl_genes <- methyl_genes[!is.na(methyl_genes)]
+
+# Display the first few methylation genes
+head(methyl_genes)
+
+# Function to calculate correlation between methylation and expression data
+meth_rna_corr <- function(sym, mpick = 3) {
+  # Subset to the first mpick methylation sites for the given gene symbol
+  methyl_ind <- which(methyl_genes == sym)
+  if (length(methyl_ind) > mpick) {
+    methyl_ind <- methyl_ind[1:mpick]
+  }
+  methyl_dat <- assay(methyl_subset)[methyl_ind,]
+
+  # Subset expression data to the selected gene symbol
+  expr_ind <- which(rownames(rnaseq_subset) == sym)
+  expr_dat <- assay(rnaseq_subset)[expr_ind,]
+
+  # Combine methylation and expression data as a data frame
+  combined_dat <- data.frame(t(methyl_dat), expr = expr_dat)
+
+  # Plot pairs and calculate correlation coefficients between methylation and expression
+  pairs(combined_dat)
+  correlations <- sapply(1:mpick, function(i) {
+    cor(as.numeric(combined_dat[, i]), combined_dat$expr)
+  })
+  correlations
+}
+
+# Calculate correlation for given gene with specified number of methylation sites
+gene_of_interest <- 'BRCA2'
+num_sites <- 3
+meth_rna_corr(gene_of_interest, num_sites)
+```
